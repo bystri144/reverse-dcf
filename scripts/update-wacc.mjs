@@ -1,0 +1,178 @@
+// Fetches WACC data from Damodaran (US HTML + EU XLS) and generates src/data/sectorWacc.ts
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const ROOT = join(__dirname, '..');
+const OUT_DIR = join(ROOT, 'src', 'data');
+const OUT_FILE = join(OUT_DIR, 'sectorWacc.ts');
+
+const US_URL = 'https://pages.stern.nyu.edu/~adamodar/New_Home_Page/datafile/wacc.html';
+const EU_URL = 'https://pages.stern.nyu.edu/~adamodar/pc/datasets/waccEurope.xls';
+
+function cleanName(raw) {
+  return raw
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function parsePct(raw) {
+  const s = raw.replace(/[%,\s]/g, '');
+  const n = parseFloat(s);
+  if (isNaN(n)) return null;
+  return Math.round(n * 100) / 10000; // e.g. "7.81" -> 0.0781, avoid float noise
+}
+
+// ── US: parse HTML table ─────────────────────────────────────────────
+async function fetchUS() {
+  const res = await fetch(US_URL);
+  if (!res.ok) throw new Error(`US fetch failed: ${res.status}`);
+  const html = await res.text();
+
+  const tableMatch = html.match(/<table[^>]*>([\s\S]*?)<\/table>/i);
+  if (!tableMatch) throw new Error('No table found in US HTML');
+
+  const rows = [...tableMatch[1].matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi)];
+  const result = {};
+
+  for (const row of rows) {
+    const cells = [...row[1].matchAll(/<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/gi)]
+      .map(m => m[1].replace(/<[^>]*>/g, '').trim());
+
+    if (cells.length < 2) continue;
+    const name = cleanName(cells[0]);
+    if (!name || name === 'Industry Name') continue;
+    if (name.startsWith('Total Market')) continue;
+
+    const waccStr = cells[cells.length - 1];
+    const wacc = parsePct(waccStr);
+    if (wacc !== null) result[name] = wacc;
+  }
+
+  return result;
+}
+
+// ── EU: parse XLS with xlsx ──────────────────────────────────────────
+async function fetchEU() {
+  let XLSX;
+  try {
+    XLSX = await import('xlsx');
+  } catch {
+    console.warn('⚠  xlsx not installed, skipping EU data');
+    return {};
+  }
+
+  const res = await fetch(EU_URL);
+  if (!res.ok) throw new Error(`EU fetch failed: ${res.status}`);
+  const buf = await res.arrayBuffer();
+
+  const wb = XLSX.read(Buffer.from(buf), { type: 'buffer' });
+  const sheetName = wb.SheetNames.find(n => /industry averages/i.test(n));
+  if (!sheetName) throw new Error('Sheet "Industry Averages" not found in EU XLS');
+
+  const sheet = wb.Sheets[sheetName];
+  const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
+
+  let nameCol = -1;
+  let waccCol = -1;
+
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    for (let j = 0; j < row.length; j++) {
+      const cell = String(row[j]).trim();
+      if (/^industry\s+name$/i.test(cell)) nameCol = j;
+      if (/cost of capital.*euro/i.test(cell)) waccCol = j;
+    }
+    if (nameCol >= 0 && waccCol >= 0) break;
+  }
+
+  if (nameCol < 0 || waccCol < 0) {
+    throw new Error('Could not find required columns in EU sheet');
+  }
+
+  const headerRowIdx = rows.findIndex(r =>
+    /^industry\s+name$/i.test(String(r[nameCol]).trim())
+  );
+
+  const result = {};
+  for (let i = headerRowIdx + 1; i < rows.length; i++) {
+    const row = rows[i];
+    const name = cleanName(String(row[nameCol] ?? ''));
+    if (!name || name.startsWith('Total Market')) continue;
+
+    const raw = row[waccCol];
+    let wacc;
+    if (typeof raw === 'number') {
+      wacc = Math.round(raw * 10000) / 10000;
+    } else {
+      wacc = parsePct(String(raw));
+    }
+    if (wacc !== null && wacc !== undefined) result[name] = wacc;
+  }
+
+  return result;
+}
+
+// ── Merge & generate ─────────────────────────────────────────────────
+async function main() {
+  let us = {};
+  let eu = {};
+
+  try {
+    us = await fetchUS();
+    console.log(`✓ US: ${Object.keys(us).length} sectors`);
+  } catch (err) {
+    console.warn(`⚠  US fetch failed, using fallback: ${err.message}`);
+  }
+
+  try {
+    eu = await fetchEU();
+    console.log(`✓ EU: ${Object.keys(eu).length} sectors`);
+  } catch (err) {
+    console.warn(`⚠  EU fetch failed, using fallback: ${err.message}`);
+  }
+
+  if (Object.keys(us).length === 0 && Object.keys(eu).length === 0) {
+    if (existsSync(OUT_FILE)) {
+      console.log('No data fetched, keeping existing file.');
+      return;
+    }
+    console.error('No data fetched and no existing file. Exiting.');
+    process.exit(1);
+  }
+
+  const allSectors = [...new Set([...Object.keys(us), ...Object.keys(eu)])].sort();
+  const merged = {};
+  for (const s of allSectors) {
+    merged[s] = { us: us[s] ?? null, eu: eu[s] ?? null };
+  }
+
+  const entries = Object.entries(merged)
+    .map(([k, v]) => `  ${JSON.stringify(k)}: { us: ${v.us}, eu: ${v.eu} }`)
+    .join(',\n');
+
+  const ts = `// Auto-generated by scripts/update-wacc.mjs -- DO NOT EDIT
+// Last updated: ${new Date().toISOString()}
+
+export const SECTOR_WACC: Record<string, { us: number | null; eu: number | null }> = {
+${entries},
+};
+
+export const SECTOR_OPTIONS: { value: string; label: string }[] = [
+  { value: '', label: 'Custom (manual)' },
+  ...Object.keys(SECTOR_WACC).sort().map((s) => ({ value: s, label: s })),
+];
+`;
+
+  if (!existsSync(OUT_DIR)) mkdirSync(OUT_DIR, { recursive: true });
+  writeFileSync(OUT_FILE, ts, 'utf-8');
+  console.log(`✓ Written ${OUT_FILE} (${allSectors.length} sectors)`);
+}
+
+main();

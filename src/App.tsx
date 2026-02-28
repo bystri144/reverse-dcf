@@ -16,9 +16,11 @@ import GlobalSettings from './components/GlobalSettings';
 import MarketInputsComp from './components/MarketInputs';
 import CashConversion from './components/CashConversion';
 import InputField from './components/InputField';
+import ToggleGroup from './components/ToggleGroup';
 import OutputPanel from './components/OutputPanel';
 import Charts from './components/Charts';
 import ProjectionTable from './components/ProjectionTable';
+import { SECTOR_WACC, SECTOR_OPTIONS } from './data/sectorWacc';
 
 function pctToStr(v: number): string {
   return v ? (v * 100).toString() : '';
@@ -52,6 +54,18 @@ export default function App() {
     baseMargin: 0.05,
     targetMargin: 0.15,
   });
+
+  const [sector, setSectorState] = useState('');
+  const [sectorRegion, setSectorRegion] = useState<'US' | 'EU'>('US');
+
+  const handleSectorChange = (newSector: string, region: 'US' | 'EU' = sectorRegion) => {
+    setSectorState(newSector);
+    setSectorRegion(region);
+    if (newSector && SECTOR_WACC[newSector]) {
+      const val = region === 'US' ? SECTOR_WACC[newSector].us : SECTOR_WACC[newSector].eu;
+      if (val !== null) setWacc(val);
+    }
+  };
 
   const [result, setResult] = useState<DcfResult | null>(null);
   const [error, setError] = useState<SolverError | null>(null);
@@ -165,6 +179,31 @@ export default function App() {
             </Section>
 
             <Section title="Forecast & Discounting">
+              <div className="mb-3">
+                <label className="block text-xs font-medium text-text-muted mb-1">Industry Sector</label>
+                <select
+                  value={sector}
+                  onChange={(e) => handleSectorChange(e.target.value)}
+                  className="w-full rounded-lg border border-border bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary/30"
+                >
+                  {SECTOR_OPTIONS.map((o) => (
+                    <option key={o.value} value={o.value}>{o.label}</option>
+                  ))}
+                </select>
+              </div>
+
+              {sector && (
+                <ToggleGroup
+                  label="Region"
+                  options={[
+                    { value: 'US', label: 'US' },
+                    { value: 'EU', label: 'EU' },
+                  ]}
+                  value={sectorRegion}
+                  onChange={(v) => handleSectorChange(sector, v as 'US' | 'EU')}
+                />
+              )}
+
               <InputField
                 label="WACC"
                 suffix="%"
@@ -173,6 +212,24 @@ export default function App() {
                 tooltip="Weighted Average Cost of Capital. Must be greater than terminal growth."
                 error={wacc <= terminalGrowth && wacc > 0 ? 'Must be > terminal growth' : undefined}
               />
+
+              {sector && SECTOR_WACC[sector] && (() => {
+                const data = SECTOR_WACC[sector];
+                const val = sectorRegion === 'US' ? data.us : data.eu;
+                if (val === null) {
+                  return (
+                    <p className="mb-2 text-[10px] text-amber-600">
+                      EU data not available for {sector}
+                    </p>
+                  );
+                }
+                return (
+                  <p className="mb-2 text-[10px] text-text-muted">
+                    Damodaran (Jan 2026) &middot; {sector}, {sectorRegion}: {(val * 100).toFixed(2)}%
+                  </p>
+                );
+              })()}
+
               <InputField
                 label="Terminal Growth Rate"
                 suffix="%"
